@@ -1,10 +1,10 @@
 # EdgeVibe
 
-EdgeVibe is an experimental, on-device AI Android application designed to generate, preview, and save single-file HTML/JS web applications. It leverages the power of local foundation models to instantly convert natural language descriptions into interactive web experiences—entirely on your device, with no internet connection required.
+EdgeVibe is an on-device AI Android app designed to generate, use, and save mini-apps. It leverages the power of local foundation models to instantly convert natural language descriptions into apps you can use, with no internet connection required.
 
 ## 🚀 Features
 
-* **Instant Webapp Generation:** Describe your app in natural language (e.g., "A random addition quiz with a score counter") and get a functional, single-file HTML/JS application within seconds.
+* **Instant Mini-App Generation:** Describe your app in natural language (e.g., "A random addition quiz with a score counter") and get a single-file HTML/JS application within seconds.
 * **On-Device AI Backends:** Choose between three different local AI engines to power your generation:
     * **MLKit (Gemini Nano):** Google's task-oriented API for Gemini Nano.
     * **AI Edge SDK (Gemini Nano):** Direct, low-level access to Gemini Nano with an expanded context window (up to 8192 output tokens) to prevent truncation of complex apps.
@@ -15,6 +15,10 @@ EdgeVibe is an experimental, on-device AI Android application designed to genera
     * **HTML Tab:** Inspect the raw, unescaped HTML/JS source code.
     * **Errors Tab:** A built-in JavaScript console logger that catches and displays any runtime errors within your generated app, complete with a notification badge.
 * **Save & Open:** Save generated webapps to your device storage. Gemini Nano automatically suggests a concise, relevant name based on your prompt. Reopen your saved webapps instantly without regenerating.
+
+Limitations:
+- Local models cannot generate long code, their output gets truncated after a certain number of tokens. This restricts the complexity of applications that can be generated.
+- Local models have limited "intelligence", and often make silly coding mistakes. When that happens, add hints to the prompt and try again.
 
 ## 🛠️ Technical Stack
 
