@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "io.github.nicolasraoul.edgevibe"
-        minSdk = 26
+        minSdk = 31
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
@@ -49,6 +49,8 @@ dependencies {
 
     // For Gemini Nano (local)
     implementation("com.google.mlkit:genai-prompt:1.0.0-alpha1")
+    implementation("com.google.ai.edge.aicore:aicore:0.0.1-exp02")
+    implementation("com.google.mediapipe:tasks-genai:0.10.14")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext)

@@ -3,6 +3,8 @@ package io.github.nicolasraoul.edgevibe
 import android.annotation.SuppressLint
 import android.os.Bundle
 import android.util.Log
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
@@ -12,6 +14,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -22,6 +26,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -29,7 +34,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.google.mlkit.genai.prompt.Generation
 import com.google.mlkit.genai.prompt.GenerateContentRequest
 import com.google.mlkit.genai.prompt.TextPart
+import com.google.ai.edge.aicore.generationConfig
+import com.google.ai.edge.aicore.GenerativeModel as EdgeGenerativeModel
+import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -65,6 +75,16 @@ fun EdgeVibeTheme(content: @Composable () -> Unit) {
 
 data class SavedWebapp(val name: String, val prompt: String, val html: String)
 
+enum class ViewMode {
+    APP, PROMPT, HTML, ERRORS
+}
+
+enum class AiBackend(val displayName: String) {
+    MLKIT("MLKit (Gemini Nano)"),
+    AICORE("AI Edge SDK (Gemini Nano)"),
+    QWEN("Qwen 3.5 2B (MediaPipe)")
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppNavigation() {
@@ -74,9 +94,12 @@ fun AppNavigation() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showOpenDialog by remember { mutableStateOf(false) }
     var showSaveDialog by remember { mutableStateOf(false) }
+    var showSettingsDialog by remember { mutableStateOf(false) }
     var suggestedName by remember { mutableStateOf("") }
-    var viewPromptInResult by remember { mutableStateOf(false) }
+    var currentViewMode by remember { mutableStateOf(ViewMode.APP) }
     var savedWebapps by remember { mutableStateOf(listOf<SavedWebapp>()) }
+    var webViewErrors by remember { mutableStateOf(listOf<String>()) }
+    var selectedBackend by remember { mutableStateOf(AiBackend.AICORE) }
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -102,6 +125,9 @@ fun AppNavigation() {
                         IconButton(onClick = { showOpenDialog = true }) {
                             Icon(Icons.Default.FolderOpen, contentDescription = "Open")
                         }
+                        IconButton(onClick = { showSettingsDialog = true }) {
+                            Icon(Icons.Default.Settings, contentDescription = "Settings")
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -121,6 +147,7 @@ fun AppNavigation() {
                         scope.launch {
                             isLoading = true
                             errorMessage = null
+                            webViewErrors = emptyList()
                             try {
                                 val fullPrompt = """
                                     You are an expert HTML dev, writing a one-file HTML webapp that fit in less than 100kB. No <head> nor style= nor any CSS. All JavaScript must be in the same HTML file, not as separate .js file. Only output the HTML.
@@ -128,13 +155,47 @@ fun AppNavigation() {
                                     $prompt
                                 """.trimIndent()
 
-                                val request = GenerateContentRequest.Builder(TextPart(fullPrompt)).build()
-                                val response = mlkitModel.generateContent(request)
-                                val text = response.candidates.firstOrNull()?.text ?: ""
+                                val text = withContext(Dispatchers.IO) {
+                                    when (selectedBackend) {
+                                        AiBackend.MLKIT -> {
+                                            val request = GenerateContentRequest.Builder(TextPart(fullPrompt)).apply {
+                                                maxOutputTokens = 256
+                                            }.build()
+                                            mlkitModel.generateContent(request).candidates.firstOrNull()?.text ?: ""
+                                        }
+                                        AiBackend.AICORE -> {
+                                            val edgeModel = EdgeGenerativeModel(
+                                                generationConfig {
+                                                    this.context = context.applicationContext
+                                                }
+                                            )
+                                            val response = edgeModel.generateContent(fullPrompt)
+                                            edgeModel.close()
+                                            response.text ?: ""
+                                        }
+                                        AiBackend.QWEN -> {
+                                            val modelFile = File(context.getExternalFilesDir(null), "qwen.bin")
+                                            if (!modelFile.exists()) {
+                                                throw Exception("Qwen model not found. Please download a MediaPipe-compatible .bin to ${modelFile.absolutePath}")
+                                            }
+                                            val options = LlmInference.LlmInferenceOptions.builder()
+                                                .setModelPath(modelFile.absolutePath)
+                                                .setMaxTokens(8192)
+                                                .build()
+                                            val qwenModel = LlmInference.createFromOptions(context, options)
+                                            val response = qwenModel.generateResponse(fullPrompt)
+                                            qwenModel.close()
+                                            response ?: ""
+                                        }
+                                    }
+                                }
+
+                                Log.e("EdgeVibe", "Generation finished. Response length: ${text.length}")
                                 generatedHtml = cleanHtml(text)
-                                viewPromptInResult = false
+                                currentViewMode = ViewMode.APP
                             } catch (e: Exception) {
                                 errorMessage = e.localizedMessage ?: "Unknown error"
+                                Log.e("EdgeVibe", "Generation failed", e)
                             } finally {
                                 isLoading = false
                             }
@@ -145,11 +206,13 @@ fun AppNavigation() {
                 ResultScreen(
                     html = generatedHtml!!,
                     prompt = prompt,
-                    viewPrompt = viewPromptInResult,
-                    onToggleView = { viewPromptInResult = !viewPromptInResult },
+                    viewMode = currentViewMode,
+                    errors = webViewErrors,
+                    onViewModeChange = { currentViewMode = it },
                     onRetry = {
                         generatedHtml = null
                         errorMessage = null
+                        webViewErrors = emptyList()
                     },
                     onSave = {
                         scope.launch {
@@ -164,11 +227,46 @@ fun AppNavigation() {
                             }
                         }
                     },
-                    onCopyPrompt = {
-                        clipboardManager.setText(AnnotatedString(prompt))
+                    onCopyContent = { text ->
+                        clipboardManager.setText(AnnotatedString(text))
+                    },
+                    onAddError = { error ->
+                        webViewErrors = webViewErrors + error
                     }
                 )
             }
+        }
+
+        if (showSettingsDialog) {
+            AlertDialog(
+                onDismissRequest = { showSettingsDialog = false },
+                title = { Text("AI Backend Settings") },
+                text = {
+                    Column {
+                        Text("Select On-Device AI Model:", fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        AiBackend.values().forEach { backend ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectedBackend = backend }
+                                    .padding(vertical = 4.dp)
+                            ) {
+                                RadioButton(
+                                    selected = (selectedBackend == backend),
+                                    onClick = { selectedBackend = backend }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(backend.displayName)
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showSettingsDialog = false }) { Text("Close") }
+                }
+            )
         }
 
         if (showOpenDialog) {
@@ -187,7 +285,8 @@ fun AppNavigation() {
                                         generatedHtml = webapp.html
                                         prompt = webapp.prompt
                                         showOpenDialog = false
-                                        viewPromptInResult = false
+                                        currentViewMode = ViewMode.APP
+                                        webViewErrors = emptyList()
                                     }
                                 )
                             }
@@ -286,33 +385,62 @@ fun PromptScreen(
 fun ResultScreen(
     html: String,
     prompt: String,
-    viewPrompt: Boolean,
-    onToggleView: () -> Unit,
+    viewMode: ViewMode,
+    errors: List<String>,
+    onViewModeChange: (ViewMode) -> Unit,
     onRetry: () -> Unit,
     onSave: () -> Unit,
-    onCopyPrompt: () -> Unit
+    onCopyContent: (String) -> Unit,
+    onAddError: (String) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
+        // Navigation row
+        ScrollableTabRow(
+            selectedTabIndex = viewMode.ordinal,
+            edgePadding = 8.dp,
+            containerColor = MaterialTheme.colorScheme.surface,
+            divider = {}
+        ) {
+            Tab(selected = viewMode == ViewMode.APP, onClick = { onViewModeChange(ViewMode.APP) }) {
+                Text("App", modifier = Modifier.padding(12.dp))
+            }
+            Tab(selected = viewMode == ViewMode.PROMPT, onClick = { onViewModeChange(ViewMode.PROMPT) }) {
+                Text("Prompt", modifier = Modifier.padding(12.dp))
+            }
+            Tab(selected = viewMode == ViewMode.HTML, onClick = { onViewModeChange(ViewMode.HTML) }) {
+                Text("HTML", modifier = Modifier.padding(12.dp))
+            }
+            Tab(selected = viewMode == ViewMode.ERRORS, onClick = { onViewModeChange(ViewMode.ERRORS) }) {
+                BadgedBox(badge = { if (errors.isNotEmpty()) Badge { Text(errors.size.toString()) } }) {
+                    Text("Errors", modifier = Modifier.padding(12.dp))
+                }
+            }
+        }
+
+        // Action row
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(8.dp),
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                .padding(horizontal = 8.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row {
-                IconButton(onClick = onRetry) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                }
-                TextButton(onClick = onToggleView) {
-                    Text(if (viewPrompt) "View App" else "View Prompt")
-                }
+            IconButton(onClick = onRetry) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back")
             }
             Row {
-                if (viewPrompt) {
-                    IconButton(onClick = onCopyPrompt) {
-                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy Prompt")
+                if (viewMode != ViewMode.APP) {
+                    IconButton(onClick = {
+                        val textToCopy = when(viewMode) {
+                            ViewMode.PROMPT -> prompt
+                            ViewMode.HTML -> html
+                            ViewMode.ERRORS -> errors.joinToString("\n")
+                            else -> ""
+                        }
+                        onCopyContent(textToCopy)
+                    }) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy")
                     }
                 }
                 IconButton(onClick = onSave) {
@@ -321,27 +449,59 @@ fun ResultScreen(
             }
         }
         
-        if (viewPrompt) {
-            Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                Text("Prompt:", fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(8.dp))
-                Text(prompt)
-            }
-        } else {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { context ->
-                    WebView(context).apply {
-                        webViewClient = WebViewClient()
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
-                    }
-                },
-                update = { webView ->
-                    webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+        Box(modifier = Modifier.fillMaxSize()) {
+            when (viewMode) {
+                ViewMode.APP -> {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { context ->
+                            WebView(context).apply {
+                                webViewClient = WebViewClient()
+                                webChromeClient = object : WebChromeClient() {
+                                    override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                                        consoleMessage?.let {
+                                            if (it.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                                                onAddError("${it.message()} (at line ${it.lineNumber()})")
+                                            }
+                                        }
+                                        return super.onConsoleMessage(consoleMessage)
+                                    }
+                                }
+                                settings.javaScriptEnabled = true
+                                settings.domStorageEnabled = true
+                                loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                            }
+                        },
+                        update = { webView ->
+                            webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                        }
+                    )
                 }
-            )
+                ViewMode.PROMPT -> {
+                    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+                        Text(prompt)
+                    }
+                }
+                ViewMode.HTML -> {
+                    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+                        Text(html, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    }
+                }
+                ViewMode.ERRORS -> {
+                    if (errors.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("No errors detected.")
+                        }
+                    } else {
+                        LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                            items(errors) { error ->
+                                Text(error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 4.dp))
+                                HorizontalDivider()
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -385,10 +545,12 @@ fun loadSavedWebapps(context: android.content.Context): List<SavedWebapp> {
         if (rootDir.exists()) {
             rootDir.listFiles()?.forEach { dir ->
                 if (dir.isDirectory) {
-                    val prompt = File(dir, "prompt.txt").readText()
-                    val html = File(dir, "app.html").readText()
-                    val name = File(dir, "name.txt").readText()
-                    list.add(SavedWebapp(name, prompt, html))
+                    val promptFile = File(dir, "prompt.txt")
+                    val htmlFile = File(dir, "app.html")
+                    val nameFile = File(dir, "name.txt")
+                    if (promptFile.exists() && htmlFile.exists() && nameFile.exists()) {
+                        list.add(SavedWebapp(nameFile.readText(), promptFile.readText(), htmlFile.readText()))
+                    }
                 }
             }
         }
