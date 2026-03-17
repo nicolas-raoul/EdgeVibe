@@ -57,7 +57,7 @@ adb shell monkey -p io.github.nicolasraoul.edgevibe -c android.intent.category.L
 
 ## 📝 User Manual
 
-For detailed instructions on how to use EdgeVibe, including simulation examples, please see the [User Manual](testing/USER_MANUAL.md) located in the `testing/` directory.
+For detailed instructions on how to use EdgeVibe, including simulation examples, please see the [User Manual](USER_MANUAL.md) located in the `testing/` directory.
 
 ## 🔒 Privacy
 
