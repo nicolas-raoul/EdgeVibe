@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.EdgeVibe" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#6200EE</item>
+    </style>
+</resources>

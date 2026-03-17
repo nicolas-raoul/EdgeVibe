@@ -1,0 +1,44 @@
+# Custom testing directory for recordings and logs
+testing/
+
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE (Android Studio / IntelliJ) files
+.idea/
+*.iml
+*.iws
+
+# Gradle files
+.gradle/
+build/
+*/build/
+
+# Local configuration file (contains absolute paths and shouldn't be checked in)
+local.properties
+
+# Log Files
+*.log
+
+# Keystore files (Keep your secrets safe!)
+*.jks
+*.keystore
+
+# NDK / C++ build files
+.cxx/
+.externalNativeBuild/
+
+# Profiling and capturing
+/captures/
