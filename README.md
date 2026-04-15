@@ -1,5 +1,7 @@
 # EdgeVibe
 
+![EdgeVibe](edgevibe.png)
+
 EdgeVibe is an on-device AI Android app designed to generate, use, and save mini-apps. It leverages the power of local foundation models to instantly convert natural language descriptions into apps you can use, with no internet connection required.
 
 ## 🚀 Features
