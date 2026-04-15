@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -75,8 +76,20 @@ fun EdgeVibeTheme(content: @Composable () -> Unit) {
 
 data class SavedWebapp(val name: String, val prompt: String, val html: String)
 
+data class Skill(val id: String, val title: String, val content: String)
+
+data class AgentState(
+    val name: String,
+    val input: String = "",
+    val output: String = "",
+    val isExpanded: Boolean = true,
+    val status: AgentStatus = AgentStatus.PENDING
+)
+
+enum class AgentStatus { PENDING, RUNNING, DONE, FAILED }
+
 enum class ViewMode {
-    APP, PROMPT, HTML, ERRORS
+    APP, PROMPT, LOG, HTML, ERRORS
 }
 
 enum class AiBackend(val displayName: String) {
@@ -100,6 +113,11 @@ fun AppNavigation() {
     var savedWebapps by remember { mutableStateOf(listOf<SavedWebapp>()) }
     var webViewErrors by remember { mutableStateOf(listOf<String>()) }
     var selectedBackend by remember { mutableStateOf(AiBackend.AICORE) }
+    var skills by remember { mutableStateOf(listOf<Skill>()) }
+    var selectedSkillIds by remember { mutableStateOf(setOf<String>()) }
+    var showSkillsDialog by remember { mutableStateOf(false) }
+    var fullPrompt by remember { mutableStateOf("") }
+    var agents by remember { mutableStateOf(listOf<AgentState>()) }
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -108,6 +126,7 @@ fun AppNavigation() {
 
     LaunchedEffect(Unit) {
         savedWebapps = loadSavedWebapps(context)
+        skills = loadSkills(context)
     }
 
     Scaffold(
@@ -117,7 +136,7 @@ fun AppNavigation() {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(8.dp))
-                        Text("EdgeVibe", fontWeight = FontWeight.Bold)
+                        Text("EdgeVibe: Vibe offline!", fontWeight = FontWeight.Bold)
                     }
                 },
                 actions = {
@@ -137,10 +156,12 @@ fun AppNavigation() {
         }
     ) { padding ->
         Box(modifier = Modifier.padding(padding)) {
-            if (generatedHtml == null) {
+            if (generatedHtml == null || isLoading) {
                 PromptScreen(
                     prompt = prompt,
                     onPromptChange = { prompt = it },
+                    selectedSkills = skills.filter { selectedSkillIds.contains(it.id) },
+                    agents = agents,
                     isLoading = isLoading,
                     errorMessage = errorMessage,
                     onGenerate = {
@@ -148,20 +169,23 @@ fun AppNavigation() {
                             isLoading = true
                             errorMessage = null
                             webViewErrors = emptyList()
-                            try {
-                                val fullPrompt = """
-                                    You are an expert HTML dev, writing a one-file HTML webapp that fit in less than 100kB. No <head> nor style= nor any CSS. All JavaScript must be in the same HTML file, not as separate .js file. Only output the HTML.
-                                    # Webapp:
-                                    $prompt
-                                """.trimIndent()
 
-                                val text = withContext(Dispatchers.IO) {
+                            suspend fun runAgentLocal(promptText: String, onChunk: (String) -> Unit): String {
+                                return withContext(Dispatchers.IO) {
                                     when (selectedBackend) {
                                         AiBackend.MLKIT -> {
-                                            val request = GenerateContentRequest.Builder(TextPart(fullPrompt)).apply {
-                                                maxOutputTokens = 256
+                                            val request = GenerateContentRequest.Builder(TextPart(promptText)).apply {
+                                                maxOutputTokens = 2048
                                             }.build()
-                                            mlkitModel.generateContent(request).candidates.firstOrNull()?.text ?: ""
+                                            var accumulatedText = ""
+                                            mlkitModel.generateContentStream(request).collect { response ->
+                                                val chunk = response.candidates.firstOrNull()?.text ?: ""
+                                                accumulatedText += chunk
+                                                withContext(Dispatchers.Main) {
+                                                    onChunk(chunk)
+                                                }
+                                            }
+                                            accumulatedText
                                         }
                                         AiBackend.AICORE -> {
                                             val edgeModel = EdgeGenerativeModel(
@@ -169,29 +193,120 @@ fun AppNavigation() {
                                                     this.context = context.applicationContext
                                                 }
                                             )
-                                            val response = edgeModel.generateContent(fullPrompt)
+                                            var accumulatedText = ""
+                                            edgeModel.generateContentStream(promptText).collect { response ->
+                                                val chunk = response.text ?: ""
+                                                accumulatedText += chunk
+                                                withContext(Dispatchers.Main) {
+                                                    onChunk(chunk)
+                                                }
+                                            }
                                             edgeModel.close()
-                                            response.text ?: ""
+                                            accumulatedText
                                         }
                                         AiBackend.QWEN -> {
                                             val modelFile = File(context.getExternalFilesDir(null), "qwen.bin")
                                             if (!modelFile.exists()) {
-                                                throw Exception("Qwen model not found. Please download a MediaPipe-compatible .bin to ${modelFile.absolutePath}")
+                                                throw Exception("Qwen model not found.")
                                             }
+                                            val deferredResult = kotlinx.coroutines.CompletableDeferred<String>()
+                                            var accumulatedText = ""
                                             val options = LlmInference.LlmInferenceOptions.builder()
                                                 .setModelPath(modelFile.absolutePath)
                                                 .setMaxTokens(8192)
+                                                .setResultListener { partialResult, done ->
+                                                    accumulatedText += partialResult
+                                                    scope.launch(Dispatchers.Main) {
+                                                        onChunk(partialResult)
+                                                    }
+                                                    if (done) {
+                                                        deferredResult.complete(accumulatedText)
+                                                    }
+                                                }
                                                 .build()
                                             val qwenModel = LlmInference.createFromOptions(context, options)
-                                            val response = qwenModel.generateResponse(fullPrompt)
+                                            qwenModel.generateResponseAsync(promptText)
+                                            val result = deferredResult.await()
                                             qwenModel.close()
-                                            response ?: ""
+                                            result
                                         }
                                     }
                                 }
+                            }
 
-                                Log.e("EdgeVibe", "Generation finished. Response length: ${text.length}")
-                                generatedHtml = cleanHtml(text)
+                            try {
+                                val selectedSkillsList = skills.filter { selectedSkillIds.contains(it.id) }
+                                val skillsText = selectedSkillsList.joinToString("\n") { "${it.title}: ${it.content}" }
+
+                                // 1. Planner Agent
+                                val plannerInput = "Analyze the user's request for a webapp and determine if they specified a particular visual style, theme, font, color, or design (e.g., 'pink', 'dark mode', 'neon', 'minimalist'). Reply with 'STYLE:YES' if they did, or 'STYLE:NO' if they didn't.\n\nRequest: $prompt.\n\nSTYLE:"
+                                agents = listOf(AgentState(name = "Planner agent", input = plannerInput, status = AgentStatus.RUNNING))
+
+                                val plannerOutput = runAgentLocal(plannerInput) { chunk ->
+                                    agents = agents.toMutableList().apply {
+                                        this[0] = this[0].copy(output = this[0].output + chunk)
+                                    }
+                                }
+                                agents = agents.toMutableList().apply {
+                                    this[0] = this[0].copy(status = AgentStatus.DONE, isExpanded = false)
+                                }
+
+                                val hasStyle = plannerOutput.trim().contains("YES", ignoreCase = true)
+
+                                // 2. Architect Agent
+                                val architectInput = "Create a one-file HTML webapp for: $prompt.\nSkills:\n$skillsText\nDo not include any CSS styles. Only output the HTML structure and JavaScript."
+                                agents = agents + AgentState(name = "Architect agent", input = architectInput, status = AgentStatus.RUNNING)
+
+                                val architectOutput = runAgentLocal(architectInput) { chunk ->
+                                    agents = agents.toMutableList().apply {
+                                        this[1] = this[1].copy(output = this[1].output + chunk)
+                                    }
+                                }
+                                agents = agents.toMutableList().apply {
+                                    this[1] = this[1].copy(status = AgentStatus.DONE, isExpanded = false)
+                                }
+
+                                var finalHtml = architectOutput
+
+                                // 3. Stylist Agent (Conditional)
+                                if (hasStyle) {
+                                    val styleInput = """
+                                        Create a CSS stylesheet for the webapp described below, focusing on the requested style.
+                                        Only output pure CSS code. Do not include any other text or markdown formatting.
+                                        
+                                        <webapp_description>
+                                        $prompt
+                                        </webapp_description>
+                                        
+                                        <generated_html>
+                                        $architectOutput
+                                        </generated_html>
+
+                                        CSS style to insert into the style section of the HTML above:
+                                    """.trimIndent()
+                                    agents = agents + AgentState(name = "Stylist agent", input = styleInput, status = AgentStatus.RUNNING)
+
+                                    val styleOutput = runAgentLocal(styleInput) { chunk ->
+                                        agents = agents.toMutableList().apply {
+                                            this[2] = this[2].copy(output = this[2].output + chunk)
+                                        }
+                                    }
+                                    agents = agents.toMutableList().apply {
+                                        this[2] = this[2].copy(status = AgentStatus.DONE, isExpanded = false)
+                                    }
+
+                                    // Inject CSS
+                                    val styleBlock = "<style>\n$styleOutput\n</style>"
+                                    finalHtml = if (architectOutput.contains("</head>")) {
+                                        architectOutput.replace("</head>", "$styleBlock\n</head>")
+                                    } else if (architectOutput.contains("<body>")) {
+                                        architectOutput.replace("<body>", "$styleBlock\n<body>")
+                                    } else {
+                                        "$styleBlock\n$architectOutput"
+                                    }
+                                }
+
+                                generatedHtml = cleanHtml(finalHtml)
                                 currentViewMode = ViewMode.APP
                             } catch (e: Exception) {
                                 errorMessage = e.localizedMessage ?: "Unknown error"
@@ -200,35 +315,38 @@ fun AppNavigation() {
                                 isLoading = false
                             }
                         }
-                    }
+                    },
+                    onSkillsClick = { showSkillsDialog = true },
+                    onSkillRemove = { skill ->
+                        selectedSkillIds = selectedSkillIds - skill.id
+                    },
+                    fullPrompt = fullPrompt,
+                    generatedHtml = generatedHtml
                 )
             } else {
                 ResultScreen(
                     html = generatedHtml!!,
                     prompt = prompt,
+                    agents = agents,
                     viewMode = currentViewMode,
                     errors = webViewErrors,
                     onViewModeChange = { currentViewMode = it },
-                    onRetry = {
-                        generatedHtml = null
-                        errorMessage = null
-                        webViewErrors = emptyList()
+                    onRetry = { 
+                        generatedHtml = null 
                     },
                     onSave = {
-                        scope.launch {
-                            try {
-                                val nameRequest = GenerateContentRequest.Builder(TextPart("Suggest a very short name (max 3 words) for a webapp described as: $prompt. Only output the name.")).build()
-                                val nameResponse = mlkitModel.generateContent(nameRequest)
-                                suggestedName = nameResponse.candidates.firstOrNull()?.text?.trim()?.replace("\"", "") ?: "My Webapp"
-                                showSaveDialog = true
-                            } catch (e: Exception) {
-                                suggestedName = "My Webapp"
-                                showSaveDialog = true
+                        saveWebapp(
+                            context = context,
+                            name = suggestedName.ifBlank { "Webapp ${savedWebapps.size + 1}" },
+                            prompt = prompt,
+                            html = generatedHtml!!,
+                            onDone = {
+                                savedWebapps = loadSavedWebapps(context)
                             }
-                        }
+                        )
                     },
                     onCopyContent = { text ->
-                        clipboardManager.setText(AnnotatedString(text))
+                        clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(text))
                     },
                     onAddError = { error ->
                         webViewErrors = webViewErrors + error
@@ -324,6 +442,27 @@ fun AppNavigation() {
                 }
             )
         }
+
+        if (showSkillsDialog) {
+            SkillsDialog(
+                skills = skills,
+                selectedSkillIds = selectedSkillIds,
+                onDismiss = { showSkillsDialog = false },
+                onSave = { newSelection ->
+                    selectedSkillIds = newSelection
+                    showSkillsDialog = false
+                },
+                onAddSkill = { title, content ->
+                    val newSkill = Skill(id = System.currentTimeMillis().toString(), title = title, content = content)
+                    saveSkill(context, newSkill)
+                    skills = loadSkills(context)
+                },
+                onEditSkill = { skill ->
+                    saveSkill(context, skill)
+                    skills = loadSkills(context)
+                }
+            )
+        }
     }
 }
 
@@ -331,24 +470,39 @@ fun AppNavigation() {
 fun PromptScreen(
     prompt: String,
     onPromptChange: (String) -> Unit,
+    selectedSkills: List<Skill>,
+    agents: List<AgentState>,
     isLoading: Boolean,
     errorMessage: String?,
-    onGenerate: () -> Unit
+    onGenerate: () -> Unit,
+    onSkillsClick: () -> Unit,
+    onSkillRemove: (Skill) -> Unit,
+    fullPrompt: String,
+    generatedHtml: String?
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+    val scrollState = rememberScrollState()
+    val isContentCentered = !isLoading && generatedHtml == null
+    val keyboardController = LocalSoftwareKeyboardController.current
+    
+    val totalOutputLength = agents.sumOf { it.output.length }
+    LaunchedEffect(totalOutputLength) {
+        if (!isContentCentered) {
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+    }
+    
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp).imePadding(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = if (isContentCentered) Arrangement.Center else Arrangement.spacedBy(16.dp)
+        ) {
         Text(
             "Describe your webapp",
             fontSize = 20.sp,
             fontWeight = FontWeight.Medium,
             modifier = Modifier.align(Alignment.Start)
         )
-        Spacer(modifier = Modifier.height(8.dp))
         OutlinedTextField(
             value = prompt,
             onValueChange = onPromptChange,
@@ -356,9 +510,30 @@ fun PromptScreen(
             placeholder = { Text("e.g. A random addition quiz with a check button") },
             shape = MaterialTheme.shapes.medium
         )
-        Spacer(modifier = Modifier.height(24.dp))
+        
+        // Tags Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Skills:", fontWeight = FontWeight.Bold)
+            selectedSkills.forEach { skill ->
+                SuggestionChip(
+                    onClick = { onSkillRemove(skill) },
+                    label = { Text(skill.title) }
+                )
+            }
+            IconButton(onClick = onSkillsClick) {
+                Icon(Icons.Default.Add, contentDescription = "Add Skill")
+            }
+        }
+        
         Button(
-            onClick = onGenerate,
+            onClick = {
+                keyboardController?.hide()
+                onGenerate()
+            },
             enabled = !isLoading && prompt.isNotBlank(),
             modifier = Modifier.fillMaxWidth().height(56.dp),
             shape = MaterialTheme.shapes.medium
@@ -374,9 +549,95 @@ fun PromptScreen(
             }
         }
         if (errorMessage != null) {
-            Spacer(modifier = Modifier.height(16.dp))
             Text(text = errorMessage, color = MaterialTheme.colorScheme.error)
         }
+
+        if (!isContentCentered && agents.isNotEmpty()) {
+            var selectedAgentIndex by remember { mutableStateOf(0) }
+            
+            // Automatically select the latest agent when the list grows
+            LaunchedEffect(agents.size) {
+                selectedAgentIndex = agents.size - 1
+            }
+            
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Headers List
+                agents.forEachIndexed { index, agent ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedAgentIndex = index }
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "🤖 ${agent.name}",
+                            fontWeight = if (selectedAgentIndex == index) FontWeight.Bold else FontWeight.Normal,
+                            color = if (selectedAgentIndex == index) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            when (agent.status) {
+                                AgentStatus.PENDING -> "⏳"
+                                AgentStatus.RUNNING -> "⚙️"
+                                AgentStatus.DONE -> "✔️"
+                                AgentStatus.FAILED -> "❌"
+                            },
+                            fontSize = 16.sp
+                        )
+                    }
+                }
+                
+                // Content Area for Selected Agent
+                val selectedAgent = agents.getOrNull(selectedAgentIndex)
+                if (selectedAgent != null) {
+                    val contentScrollState = rememberScrollState()
+                    
+                    // Auto-scroll content area to bottom when output changes
+                    LaunchedEffect(selectedAgent.output.length) {
+                        contentScrollState.animateScrollTo(contentScrollState.maxValue)
+                    }
+                    
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .verticalScroll(contentScrollState),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("LLM Input:", fontWeight = FontWeight.Bold)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(8.dp)
+                        ) {
+                            Text(selectedAgent.input, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                        }
+                        
+                        Spacer(modifier = Modifier.height(8.dp))
+                        
+                        Text("LLM Output:", fontWeight = FontWeight.Bold)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(8.dp)
+                        ) {
+                            Text(selectedAgent.output, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
     }
 }
 
@@ -385,6 +646,7 @@ fun PromptScreen(
 fun ResultScreen(
     html: String,
     prompt: String,
+    agents: List<AgentState>,
     viewMode: ViewMode,
     errors: List<String>,
     onViewModeChange: (ViewMode) -> Unit,
@@ -406,6 +668,9 @@ fun ResultScreen(
             }
             Tab(selected = viewMode == ViewMode.PROMPT, onClick = { onViewModeChange(ViewMode.PROMPT) }) {
                 Text("Prompt", modifier = Modifier.padding(12.dp))
+            }
+            Tab(selected = viewMode == ViewMode.LOG, onClick = { onViewModeChange(ViewMode.LOG) }) {
+                Text("Log", modifier = Modifier.padding(12.dp))
             }
             Tab(selected = viewMode == ViewMode.HTML, onClick = { onViewModeChange(ViewMode.HTML) }) {
                 Text("HTML", modifier = Modifier.padding(12.dp))
@@ -482,6 +747,81 @@ fun ResultScreen(
                         Text(prompt)
                     }
                 }
+                ViewMode.LOG -> {
+                    var selectedAgentIndex by remember { mutableStateOf(0) }
+                    
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // Headers List
+                        agents.forEachIndexed { index, agent ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectedAgentIndex = index }
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "🤖 ${agent.name}",
+                                    fontWeight = if (selectedAgentIndex == index) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selectedAgentIndex == index) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    when (agent.status) {
+                                        AgentStatus.PENDING -> "⏳"
+                                        AgentStatus.RUNNING -> "⚙️"
+                                        AgentStatus.DONE -> "✔️"
+                                        AgentStatus.FAILED -> "❌"
+                                    },
+                                    fontSize = 16.sp
+                                )
+                            }
+                        }
+                        
+                        Spacer(modifier = Modifier.height(8.dp))
+                        
+                        // Content Area for Selected Agent
+                        val selectedAgent = agents.getOrNull(selectedAgentIndex)
+                        if (selectedAgent != null) {
+                            val contentScrollState = rememberScrollState()
+                            
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                                    .verticalScroll(contentScrollState),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text("LLM Input:", fontWeight = FontWeight.Bold)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                                        .padding(8.dp)
+                                ) {
+                                    Text(selectedAgent.input, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                }
+                                
+                                Spacer(modifier = Modifier.height(8.dp))
+                                
+                                Text("LLM Output:", fontWeight = FontWeight.Bold)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                                        .padding(8.dp)
+                                ) {
+                                    Text(selectedAgent.output, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
                 ViewMode.HTML -> {
                     Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
                         Text(html, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
@@ -503,6 +843,119 @@ fun ResultScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+fun SkillsDialog(
+    skills: List<Skill>,
+    selectedSkillIds: Set<String>,
+    onDismiss: () -> Unit,
+    onSave: (Set<String>) -> Unit,
+    onAddSkill: (String, String) -> Unit,
+    onEditSkill: (Skill) -> Unit
+) {
+    var currentSelection by remember { mutableStateOf(selectedSkillIds) }
+    var showAddDialog by remember { mutableStateOf(false) }
+    var skillToEdit by remember { mutableStateOf<Skill?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Skills") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Button(onClick = { showAddDialog = true }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Add Skill")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyColumn(modifier = Modifier.height(300.dp)) {
+                    items(skills) { skill ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        ) {
+                            Checkbox(
+                                checked = currentSelection.contains(skill.id),
+                                onCheckedChange = { checked ->
+                                    currentSelection = if (checked) {
+                                        currentSelection + skill.id
+                                    } else {
+                                        currentSelection - skill.id
+                                    }
+                                }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(skill.title, fontWeight = FontWeight.Bold)
+                                Text(skill.content, fontSize = 12.sp, maxLines = 1)
+                            }
+                            IconButton(onClick = { skillToEdit = skill }) {
+                                Icon(Icons.Default.Edit, contentDescription = "Edit")
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onSave(currentSelection) }) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+
+    if (showAddDialog) {
+        var title by remember { mutableStateOf("") }
+        var content by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showAddDialog = false },
+            title = { Text("Add Skill") },
+            text = {
+                Column {
+                    TextField(value = title, onValueChange = { title = it }, label = { Text("Title") })
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextField(value = content, onValueChange = { content = it }, label = { Text("Content") })
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (title.isNotBlank() && content.isNotBlank()) {
+                        onAddSkill(title, content)
+                        showAddDialog = false
+                    }
+                }) { Text("Add") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (skillToEdit != null) {
+        var title by remember { mutableStateOf(skillToEdit!!.title) }
+        var content by remember { mutableStateOf(skillToEdit!!.content) }
+        AlertDialog(
+            onDismissRequest = { skillToEdit = null },
+            title = { Text("Edit Skill") },
+            text = {
+                Column {
+                    TextField(value = title, onValueChange = { title = it }, label = { Text("Title") })
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextField(value = content, onValueChange = { content = it }, label = { Text("Content") })
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (title.isNotBlank() && content.isNotBlank()) {
+                        onEditSkill(Skill(skillToEdit!!.id, title, content))
+                        skillToEdit = null
+                    }
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { skillToEdit = null }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -556,6 +1009,38 @@ fun loadSavedWebapps(context: android.content.Context): List<SavedWebapp> {
         }
     } catch (e: Exception) {
         Log.e("EdgeVibe", "Load failed", e)
+    }
+    return list
+}
+
+fun saveSkill(context: android.content.Context, skill: Skill) {
+    try {
+        val dir = File(context.getExternalFilesDir(null), "skills/${skill.id}")
+        dir.mkdirs()
+        File(dir, "title.txt").writeText(skill.title)
+        File(dir, "content.txt").writeText(skill.content)
+    } catch (e: Exception) {
+        Log.e("EdgeVibe", "Save skill failed", e)
+    }
+}
+
+fun loadSkills(context: android.content.Context): List<Skill> {
+    val list = mutableListOf<Skill>()
+    try {
+        val rootDir = File(context.getExternalFilesDir(null), "skills")
+        if (rootDir.exists()) {
+            rootDir.listFiles()?.forEach { dir ->
+                if (dir.isDirectory) {
+                    val titleFile = File(dir, "title.txt")
+                    val contentFile = File(dir, "content.txt")
+                    if (titleFile.exists() && contentFile.exists()) {
+                        list.add(Skill(dir.name, titleFile.readText(), contentFile.readText()))
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) {
+        Log.e("EdgeVibe", "Load skills failed", e)
     }
     return list
 }
