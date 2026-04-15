@@ -9,9 +9,11 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -239,7 +241,29 @@ fun AppNavigation() {
                                 val skillsText = selectedSkillsList.joinToString("\n") { "${it.title}: ${it.content}" }
 
                                 // 1. Planner Agent
-                                val plannerInput = "Analyze the user's request for a webapp and determine if they specified a particular visual style, theme, font, color, or design (e.g., 'pink', 'dark mode', 'neon', 'minimalist'). Reply with 'STYLE:YES' if they did, or 'STYLE:NO' if they didn't.\n\nRequest: $prompt.\n\nSTYLE:"
+                                val plannerInput = """
+                                    You direct a team of skilled agents to build a webapp.
+                                    You will receive a description of the webapp to build.
+                                    Based on that webapp description, call the agents that are needed.
+                                    Each agent has very specialized skills, only call the agents whose skills are needed.
+                                    Here are the agents in the format `AGENT_NAME: Skills`:
+                                    - ARCHITECT: Always required.
+                                    - STYLIST: Use colors, fonts, themes, design.
+
+                                    Example 1:
+
+                                    Webapp: 10-sided dice
+                                    Agents: ARCHITECT
+
+                                    Example 2:
+
+                                    Webapp: Math quizz with pink theme
+                                    Agents: ARCHITECT STYLIST
+
+                                    Current task:
+                                    Webapp: $prompt
+                                    Agents:
+                                """.trimIndent()
                                 agents = listOf(AgentState(name = "Planner agent", input = plannerInput, status = AgentStatus.RUNNING))
 
                                 val plannerOutput = runAgentLocal(plannerInput) { chunk ->
@@ -251,10 +275,23 @@ fun AppNavigation() {
                                     this[0] = this[0].copy(status = AgentStatus.DONE, isExpanded = false)
                                 }
 
-                                val hasStyle = plannerOutput.trim().contains("YES", ignoreCase = true)
+                                val hasStyle = plannerOutput.contains("STYLIST", ignoreCase = true)
 
                                 // 2. Architect Agent
-                                val architectInput = "Create a one-file HTML webapp for: $prompt.\nSkills:\n$skillsText\nDo not include any CSS styles. Only output the HTML structure and JavaScript."
+                                val architectInput = """
+                                    You are an expert HTML dev, writing a one-file HTML webapp that fits in less than 100kB.
+                                    Create a one-file HTML webapp for:
+                                    $prompt.
+                                    ${if (skillsText.isNotEmpty()) "\nTips:\n$skillsText\n" else ""}
+                                    Important:
+                                    - No <head> nor <link> nor style= nor any CSS.
+                                    - Only output the HTML structure and JavaScript.
+                                    - All JavaScript must be in the same HTML file, not as separate .js file.
+                                    - Do not retrieve anything from the Internet nor use external APIs, the webapp must work offline.
+                                    - Only output the HTML.
+
+                                    HTML:
+                                """.trimIndent()
                                 agents = agents + AgentState(name = "Architect agent", input = architectInput, status = AgentStatus.RUNNING)
 
                                 val architectOutput = runAgentLocal(architectInput) { chunk ->
@@ -296,7 +333,11 @@ fun AppNavigation() {
                                     }
 
                                     // Inject CSS
-                                    val styleBlock = "<style>\n$styleOutput\n</style>"
+                                    val cleanStyleOutput = styleOutput
+                                        .replace("```css", "")
+                                        .replace("```", "")
+                                        .trim()
+                                    val styleBlock = "<style>\n$cleanStyleOutput\n</style>"
                                     finalHtml = if (architectOutput.contains("</head>")) {
                                         architectOutput.replace("</head>", "$styleBlock\n</head>")
                                     } else if (architectOutput.contains("<body>")) {
@@ -484,6 +525,16 @@ fun PromptScreen(
     val isContentCentered = !isLoading && generatedHtml == null
     val keyboardController = LocalSoftwareKeyboardController.current
     
+    val infiniteTransition = rememberInfiniteTransition()
+    val angle by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
+    
     val totalOutputLength = agents.sumOf { it.output.length }
     LaunchedEffect(totalOutputLength) {
         if (!isContentCentered) {
@@ -590,7 +641,12 @@ fun PromptScreen(
                                 AgentStatus.DONE -> "✔️"
                                 AgentStatus.FAILED -> "❌"
                             },
-                            fontSize = 16.sp
+                            fontSize = 16.sp,
+                            modifier = if (agent.status == AgentStatus.RUNNING) {
+                                Modifier.rotate(angle)
+                            } else {
+                                Modifier
+                            }
                         )
                     }
                 }
@@ -655,6 +711,16 @@ fun ResultScreen(
     onCopyContent: (String) -> Unit,
     onAddError: (String) -> Unit
 ) {
+    val infiniteTransition = rememberInfiniteTransition()
+    val angle by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
+
     Column(modifier = Modifier.fillMaxSize()) {
         // Navigation row
         ScrollableTabRow(
@@ -778,7 +844,12 @@ fun ResultScreen(
                                         AgentStatus.DONE -> "✔️"
                                         AgentStatus.FAILED -> "❌"
                                     },
-                                    fontSize = 16.sp
+                                    fontSize = 16.sp,
+                                    modifier = if (agent.status == AgentStatus.RUNNING) {
+                                        Modifier.rotate(angle)
+                                    } else {
+                                        Modifier
+                                    }
                                 )
                             }
                         }
