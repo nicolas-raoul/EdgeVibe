@@ -78,27 +78,11 @@ fun EdgeVibeTheme(content: @Composable () -> Unit) {
 
 data class SavedWebapp(val name: String, val prompt: String, val html: String)
 
-data class Skill(val id: String, val title: String, val content: String)
-
-data class AgentState(
-    val name: String,
-    val input: String = "",
-    val output: String = "",
-    val isExpanded: Boolean = true,
-    val status: AgentStatus = AgentStatus.PENDING
-)
-
-enum class AgentStatus { PENDING, RUNNING, DONE, FAILED }
-
 enum class ViewMode {
     APP, PROMPT, LOG, HTML, ERRORS
 }
 
-enum class AiBackend(val displayName: String) {
-    MLKIT("MLKit (Gemini Nano)"),
-    AICORE("AI Edge SDK (Gemini Nano)"),
-    QWEN("Qwen 3.5 2B (MediaPipe)")
-}
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -172,189 +156,31 @@ fun AppNavigation() {
                             errorMessage = null
                             webViewErrors = emptyList()
 
-                            suspend fun runAgentLocal(promptText: String, onChunk: (String) -> Unit): String {
-                                return withContext(Dispatchers.IO) {
-                                    when (selectedBackend) {
-                                        AiBackend.MLKIT -> {
-                                            val request = GenerateContentRequest.Builder(TextPart(promptText)).apply {
-                                                maxOutputTokens = 2048
-                                            }.build()
-                                            var accumulatedText = ""
-                                            mlkitModel.generateContentStream(request).collect { response ->
-                                                val chunk = response.candidates.firstOrNull()?.text ?: ""
-                                                accumulatedText += chunk
-                                                withContext(Dispatchers.Main) {
-                                                    onChunk(chunk)
-                                                }
-                                            }
-                                            accumulatedText
-                                        }
-                                        AiBackend.AICORE -> {
-                                            val edgeModel = EdgeGenerativeModel(
-                                                generationConfig {
-                                                    this.context = context.applicationContext
-                                                }
-                                            )
-                                            var accumulatedText = ""
-                                            edgeModel.generateContentStream(promptText).collect { response ->
-                                                val chunk = response.text ?: ""
-                                                accumulatedText += chunk
-                                                withContext(Dispatchers.Main) {
-                                                    onChunk(chunk)
-                                                }
-                                            }
-                                            edgeModel.close()
-                                            accumulatedText
-                                        }
-                                        AiBackend.QWEN -> {
-                                            val modelFile = File(context.getExternalFilesDir(null), "qwen.bin")
-                                            if (!modelFile.exists()) {
-                                                throw Exception("Qwen model not found.")
-                                            }
-                                            val deferredResult = kotlinx.coroutines.CompletableDeferred<String>()
-                                            var accumulatedText = ""
-                                            val options = LlmInference.LlmInferenceOptions.builder()
-                                                .setModelPath(modelFile.absolutePath)
-                                                .setMaxTokens(8192)
-                                                .setResultListener { partialResult, done ->
-                                                    accumulatedText += partialResult
-                                                    scope.launch(Dispatchers.Main) {
-                                                        onChunk(partialResult)
-                                                    }
-                                                    if (done) {
-                                                        deferredResult.complete(accumulatedText)
-                                                    }
-                                                }
-                                                .build()
-                                            val qwenModel = LlmInference.createFromOptions(context, options)
-                                            qwenModel.generateResponseAsync(promptText)
-                                            val result = deferredResult.await()
-                                            qwenModel.close()
-                                            result
-                                        }
-                                    }
+
+
+                            val selectedSkillsList = skills.filter { selectedSkillIds.contains(it.id) }
+                            val skillsText = selectedSkillsList.joinToString("\n") { "${it.title}: ${it.content}" }
+
+                            generateWebapp(
+                                prompt = prompt,
+                                skillsText = skillsText,
+                                context = context,
+                                selectedBackend = selectedBackend,
+                                mlkitModel = mlkitModel,
+                                scope = scope,
+                                onAgentsChange = { updatedAgents ->
+                                    agents = updatedAgents
+                                },
+                                onHtmlGenerated = { html ->
+                                    generatedHtml = html
+                                    currentViewMode = ViewMode.APP
+                                    isLoading = false
+                                },
+                                onError = { error ->
+                                    errorMessage = error
+                                    isLoading = false
                                 }
-                            }
-
-                            try {
-                                val selectedSkillsList = skills.filter { selectedSkillIds.contains(it.id) }
-                                val skillsText = selectedSkillsList.joinToString("\n") { "${it.title}: ${it.content}" }
-
-                                // 1. Planner Agent
-                                val plannerInput = """
-                                    You direct a team of skilled agents to build a webapp.
-                                    You will receive a description of the webapp to build.
-                                    Based on that webapp description, call the agents that are needed.
-                                    Each agent has very specialized skills, only call the agents whose skills are needed.
-                                    Here are the agents in the format `AGENT_NAME: Skills`:
-                                    - ARCHITECT: Always required.
-                                    - STYLIST: Use colors, fonts, themes, design.
-
-                                    Example 1:
-
-                                    Webapp: 10-sided dice
-                                    Agents: ARCHITECT
-
-                                    Example 2:
-
-                                    Webapp: Math quizz with pink theme
-                                    Agents: ARCHITECT STYLIST
-
-                                    Current task:
-                                    Webapp: $prompt
-                                    Agents:
-                                """.trimIndent()
-                                agents = listOf(AgentState(name = "Planner agent", input = plannerInput, status = AgentStatus.RUNNING))
-
-                                val plannerOutput = runAgentLocal(plannerInput) { chunk ->
-                                    agents = agents.toMutableList().apply {
-                                        this[0] = this[0].copy(output = this[0].output + chunk)
-                                    }
-                                }
-                                agents = agents.toMutableList().apply {
-                                    this[0] = this[0].copy(status = AgentStatus.DONE, isExpanded = false)
-                                }
-
-                                val hasStyle = plannerOutput.contains("STYLIST", ignoreCase = true)
-
-                                // 2. Architect Agent
-                                val architectInput = """
-                                    You are an expert HTML dev, writing a one-file HTML webapp that fits in less than 100kB.
-                                    Create a one-file HTML webapp for:
-                                    $prompt.
-                                    ${if (skillsText.isNotEmpty()) "\nTips:\n$skillsText\n" else ""}
-                                    Important:
-                                    - No <head> nor <link> nor style= nor any CSS.
-                                    - Only output the HTML structure and JavaScript.
-                                    - All JavaScript must be in the same HTML file, not as separate .js file.
-                                    - Do not retrieve anything from the Internet nor use external APIs, the webapp must work offline.
-                                    - Only output the HTML.
-
-                                    HTML:
-                                """.trimIndent()
-                                agents = agents + AgentState(name = "Architect agent", input = architectInput, status = AgentStatus.RUNNING)
-
-                                val architectOutput = runAgentLocal(architectInput) { chunk ->
-                                    agents = agents.toMutableList().apply {
-                                        this[1] = this[1].copy(output = this[1].output + chunk)
-                                    }
-                                }
-                                agents = agents.toMutableList().apply {
-                                    this[1] = this[1].copy(status = AgentStatus.DONE, isExpanded = false)
-                                }
-
-                                var finalHtml = architectOutput
-
-                                // 3. Stylist Agent (Conditional)
-                                if (hasStyle) {
-                                    val styleInput = """
-                                        Create a CSS stylesheet for the webapp described below, focusing on the requested style.
-                                        Only output pure CSS code. Do not include any other text or markdown formatting.
-                                        
-                                        <webapp_description>
-                                        $prompt
-                                        </webapp_description>
-                                        
-                                        <generated_html>
-                                        $architectOutput
-                                        </generated_html>
-
-                                        CSS style to insert into the style section of the HTML above:
-                                    """.trimIndent()
-                                    agents = agents + AgentState(name = "Stylist agent", input = styleInput, status = AgentStatus.RUNNING)
-
-                                    val styleOutput = runAgentLocal(styleInput) { chunk ->
-                                        agents = agents.toMutableList().apply {
-                                            this[2] = this[2].copy(output = this[2].output + chunk)
-                                        }
-                                    }
-                                    agents = agents.toMutableList().apply {
-                                        this[2] = this[2].copy(status = AgentStatus.DONE, isExpanded = false)
-                                    }
-
-                                    // Inject CSS
-                                    val cleanStyleOutput = styleOutput
-                                        .replace("```css", "")
-                                        .replace("```", "")
-                                        .trim()
-                                    val styleBlock = "<style>\n$cleanStyleOutput\n</style>"
-                                    finalHtml = if (architectOutput.contains("</head>")) {
-                                        architectOutput.replace("</head>", "$styleBlock\n</head>")
-                                    } else if (architectOutput.contains("<body>")) {
-                                        architectOutput.replace("<body>", "$styleBlock\n<body>")
-                                    } else {
-                                        "$styleBlock\n$architectOutput"
-                                    }
-                                }
-
-                                generatedHtml = cleanHtml(finalHtml)
-                                currentViewMode = ViewMode.APP
-                            } catch (e: Exception) {
-                                errorMessage = e.localizedMessage ?: "Unknown error"
-                                Log.e("EdgeVibe", "Generation failed", e)
-                            } finally {
-                                isLoading = false
-                            }
+                            )
                         }
                     },
                     onSkillsClick = { showSkillsDialog = true },
@@ -1030,23 +856,7 @@ fun SkillsDialog(
     }
 }
 
-fun cleanHtml(input: String): String {
-    var cleaned = input
-    val startIndex = cleaned.indexOf("```html", ignoreCase = true)
-    if (startIndex != -1) {
-        cleaned = cleaned.substring(startIndex + 7)
-    } else {
-        val genericStart = cleaned.indexOf("```")
-        if (genericStart != -1) {
-            cleaned = cleaned.substring(genericStart + 3)
-        }
-    }
-    val endIndex = cleaned.lastIndexOf("```")
-    if (endIndex != -1) {
-        cleaned = cleaned.substring(0, endIndex)
-    }
-    return cleaned.trim()
-}
+
 
 fun saveWebapp(context: android.content.Context, name: String, prompt: String, html: String, onDone: () -> Unit) {
     try {
@@ -1084,34 +894,4 @@ fun loadSavedWebapps(context: android.content.Context): List<SavedWebapp> {
     return list
 }
 
-fun saveSkill(context: android.content.Context, skill: Skill) {
-    try {
-        val dir = File(context.getExternalFilesDir(null), "skills/${skill.id}")
-        dir.mkdirs()
-        File(dir, "title.txt").writeText(skill.title)
-        File(dir, "content.txt").writeText(skill.content)
-    } catch (e: Exception) {
-        Log.e("EdgeVibe", "Save skill failed", e)
-    }
-}
 
-fun loadSkills(context: android.content.Context): List<Skill> {
-    val list = mutableListOf<Skill>()
-    try {
-        val rootDir = File(context.getExternalFilesDir(null), "skills")
-        if (rootDir.exists()) {
-            rootDir.listFiles()?.forEach { dir ->
-                if (dir.isDirectory) {
-                    val titleFile = File(dir, "title.txt")
-                    val contentFile = File(dir, "content.txt")
-                    if (titleFile.exists() && contentFile.exists()) {
-                        list.add(Skill(dir.name, titleFile.readText(), contentFile.readText()))
-                    }
-                }
-            }
-        }
-    } catch (e: Exception) {
-        Log.e("EdgeVibe", "Load skills failed", e)
-    }
-    return list
-}
